@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// Cleanable defines an interface for types that require explicit resource cleanup.
+// If a dropped item implements this interface, its Cleanup method will be called.
+type Cleanable interface {
+	Cleanup()
+}
+
 // config holds the configurable parameters for a Limiter.
 type config[T any] struct {
 	bufferSize int
@@ -26,9 +32,10 @@ func WithBufferSize[T any](size int) Option[T] {
 	}
 }
 
-// Limiter manages the regulated flow of data of a specific type T.
-// It ensures thread safety and drops the oldest data in favor of the most recent
-// item when the production rate exceeds the consumption rate.
+// Limiter manages the regulated flow of data of any specific type T.
+// It ensures thread safety and drops the oldest data in favor of the most
+// recent item. If a dropped item implements the Cleanable interface, its
+// Cleanup() method is called.
 type Limiter[T any] struct {
 	input  chan T
 	output chan T
@@ -36,29 +43,28 @@ type Limiter[T any] struct {
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
 
-	// mu protects access to the latestData and hasData fields, which are
-	// shared between the collector and ticker goroutines.
+	// mu protects access to latestData and hasData, which are shared
+	// between the collector and ticker goroutines.
 	mu         sync.Mutex
 	latestData T
 	hasData    bool
 }
 
-// New creates a new Limiter for a specific data type T with a given rate per second.
-// It can be configured with functional options like WithBufferSize.
+// New creates a new Limiter for any specific data type T with a given rate per second.
 func New[T any](rate int, opts ...Option[T]) *Limiter[T] {
 	if rate <= 0 {
 		rate = 1
 	}
 
-	// 1. Setup default configuration.
-	// The default buffer size is based on the rate, which helps absorb
-	// at least one second of burst traffic. We apply reasonable bounds.
+	// 1. Setup default configuration. The default buffer size is based on the
+	// rate, which helps absorb at least one second of burst traffic. We apply
+	// reasonable bounds to prevent excessive memory usage.
 	defaultBufferSize := rate
 	if defaultBufferSize < 16 {
-		defaultBufferSize = 16 // A reasonable minimum for low-rate limiters.
+		defaultBufferSize = 16
 	}
 	if defaultBufferSize > 1024 {
-		defaultBufferSize = 1024 // A reasonable maximum to prevent excessive memory usage.
+		defaultBufferSize = 1024
 	}
 	cfg := &config[T]{
 		bufferSize: defaultBufferSize,
@@ -72,7 +78,7 @@ func New[T any](rate int, opts ...Option[T]) *Limiter[T] {
 	// 3. Create the limiter with the final configuration.
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Limiter[T]{
-		input:  make(chan T, cfg.bufferSize), // Use the final buffer size.
+		input:  make(chan T, cfg.bufferSize),
 		output: make(chan T, 1),
 		rate:   time.Second / time.Duration(rate),
 		cancel: cancel,
@@ -106,6 +112,13 @@ func (l *Limiter[T]) process(ctx context.Context) {
 					return
 				}
 				l.mu.Lock()
+				// If we are about to overwrite an existing unsent item, check if it's
+				// Cleanable and call its Cleanup method.
+				if l.hasData {
+					if cleanable, ok := any(l.latestData).(Cleanable); ok {
+						cleanable.Cleanup()
+					}
+				}
 				l.latestData = data
 				l.hasData = true
 				l.mu.Unlock()
@@ -137,10 +150,10 @@ func (l *Limiter[T]) process(ctx context.Context) {
 						// Sent successfully, so we can forget the data.
 						l.hasData = false
 					default:
-						// Consumer was not ready. We DO NOT change hasData.
-						// This means we will retry sending the same item on
-						// the next tick, unless the collector overwrites it
-						// with newer data first.
+						// Consumer was not ready. We DO NOTHING.
+						// The hasData flag remains true, so we will retry sending
+						// this item on the next tick, unless the collector
+						// overwrites it with newer data first.
 					}
 				}
 				l.mu.Unlock()
@@ -153,15 +166,23 @@ func (l *Limiter[T]) process(ctx context.Context) {
 	// Wait for the context to be canceled (via Stop()), then begin shutdown.
 	<-ctx.Done()
 
-	// Close the input channel. This will cause the collector goroutine to
-	// exit its loop and terminate.
+	// 1. Close the input channel. This signals the collector goroutine to stop.
 	close(l.input)
 
-	// Wait for both the collector and ticker goroutines to finish.
+	// 2. Wait for both the collector and ticker goroutines to finish.
 	processWg.Wait()
 
-	// Finally, close the output channel. This signals to any consumers
-	// that no more data will be sent.
+	// 3. Final cleanup for any data that was held when the limiter was stopped.
+	l.mu.Lock()
+	if l.hasData {
+		if cleanable, ok := any(l.latestData).(Cleanable); ok {
+			cleanable.Cleanup()
+		}
+	}
+	l.mu.Unlock()
+
+	// 4. Finally, close the output channel to signal to consumers that no
+	// more data will be sent.
 	close(l.output)
 }
 
@@ -178,9 +199,11 @@ func (l *Limiter[T]) Send(data T) {
 	case l.input <- data:
 		// Data successfully sent to the input buffer.
 	default:
-		// The input buffer is full. This means the producer is sending
-		// data much faster than the collector can process it. The data
-		// is dropped, which is the desired backpressure behavior.
+		// The input buffer is full. The data is dropped.
+		// Check if the dropped data is Cleanable and call its Cleanup method.
+		if cleanable, ok := any(data).(Cleanable); ok {
+			cleanable.Cleanup()
+		}
 	}
 }
 
