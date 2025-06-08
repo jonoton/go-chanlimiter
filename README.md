@@ -30,53 +30,86 @@ Create a simple limiter for `int` types at a rate of 5 items per second.
 limiter := chanlimiter.New[int](5)
 defer limiter.Stop()
 
-/* Producer sends data faster than the limiter's rate. */
+// Producer sends data faster than the limiter's rate.
 go func() {
 	for i := 0; i < 20; i++ {
 		limiter.Send(i)
-		time.Sleep(100 * time.Millisecond) /* 10 items/sec */
+		time.Sleep(100 * time.Millisecond) // 10 items/sec
 	}
 }()
 
-/* Consumer receives data at the regulated rate. */
+// Consumer receives data at the regulated rate.
 for msg := range limiter.Output() {
 	fmt.Printf("Received: %d\n", msg)
 }
 ```
 
-## Advanced Usage with Cleanup
+## Advanced Usage: Cleanup Scenarios
 
-This example shows how to use a custom buffer size and how the automatic
-cleanup feature works for types that manage resources.
+The following examples demonstrate the two ways an item's `Cleanup()` method
+is called automatically. First, we define a common `Resource` type.
 
 ```go
-/* Define a type that holds a resource and needs cleanup. */
+// Define a type that holds a resource and needs cleanup.
 type Resource struct {
 	ID int
 }
 
-/* Implement the Cleanable interface. */
+// Implement the Cleanable interface.
 func (r *Resource) Cleanup() {
 	fmt.Printf("Cleaning up resource %d\n", r.ID)
 }
+```
 
-/* Create a limiter with a small custom buffer. */
+### Scenario 1: Dropping a New Item (Buffer Full)
+
+This happens when `Send()` is called but the input buffer is full. The new item is
+immediately dropped and cleaned up because it was never accepted.
+
+```go
+// Create a limiter with a small custom buffer of size 1.
 limiter := chanlimiter.New[*Resource](
-	2, /* 2 items per second */
+	1, // 1 item per second
 	chanlimiter.WithBufferSize[*Resource](1),
 )
 defer limiter.Stop()
 
-/* Send two items. The first will be held, the second will fill the buffer. */
+// Send an item to fill the buffer.
 limiter.Send(&Resource{ID: 1})
-limiter.Send(&Resource{ID: 2})
 
-/* This third item will be dropped because the buffer is full,
-	and its Cleanup() method will be called automatically. */
-limiter.Send(&Resource{ID: 3}) /* Prints "Cleaning up resource 3" */
+// Because the collector goroutine is unlikely to have run yet, the buffer
+// is still full. This second send is dropped, and its Cleanup()
+// method is called automatically.
+limiter.Send(&Resource{ID: 2}) // Prints "Cleaning up resource 2"
 
-/* The consumer will receive the items at the specified rate. */
+// The consumer will eventually receive item 1.
 for res := range limiter.Output() {
-	fmt.Printf("Processing resource %d\n", res.ID)
+	fmt.Printf("Processing resource %d\n", res.ID) // Prints "Processing resource 1"
+}
+```
+
+### Scenario 2: Dropping an Old Item (Overwrite)
+
+This happens when a new item arrives and overwrites an older item that the limiter
+was holding but had not yet sent. The older item is cleaned up.
+
+```go
+limiter := chanlimiter.New[*Resource](1) // 1 item per second
+defer limiter.Stop()
+
+// Send an item.
+limiter.Send(&Resource{ID: 10})
+
+// Wait long enough for the collector to process the item internally,
+// but not long enough for the ticker to send it.
+time.Sleep(50 * time.Millisecond)
+
+// This second send will overwrite the held item (ID 10), causing
+// its Cleanup() method to be called.
+limiter.Send(&Resource{ID: 11}) // Prints "Cleaning up resource 10"
+
+// The consumer will eventually receive the newer item.
+for res := range limiter.Output() {
+	fmt.Printf("Processing resource %d\n", res.ID) // Prints "Processing resource 11"
 }
 ```
