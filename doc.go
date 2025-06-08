@@ -1,10 +1,6 @@
-# go-chanlimiter
-
+/*
 Package chanlimiter provides a generic, type-safe mechanism to regulate the flow of
 data through a channel at a specified rate.
-
-[![Go Reference](https://pkg.go.dev/badge/github.com/jonoton/go-chanlimiter.svg)](https://pkg.go.dev/github.com/jonoton/go-chanlimiter)
-[![Go Report Card](https://goreportcard.com/badge/github.com/jonoton/go-chanlimiter?)](https://goreportcard.com/report/github.com/jonoton/go-chanlimiter)
 
 It is designed for scenarios where data is produced at a high or unpredictable
 frequency, but consumption needs to be controlled or "throttled" to a steady pace.
@@ -12,7 +8,7 @@ The limiter ensures thread safety and handles backpressure by dropping the oldes
 unprocessed data in favor of the most recent item, ensuring the consumer
 always processes the most up-to-date information.
 
-## Key Features
+Key Features:
 
   - **Type-Safe with Generics:** Instantiate a Limiter for any Go type (e.g., string,
     int, struct) and work with that type directly, avoiding runtime type assertions.
@@ -23,13 +19,12 @@ always processes the most up-to-date information.
   - **Graceful Shutdown:** Provides a Stop() method to safely terminate the background
     goroutine and prevent resource leaks.
 
-## Usage
+Usage:
 
 The following example creates a limiter for `string` types that allows 5 items per
 second. A producer sends data at a faster rate (10 items/sec), and the consumer
 receives the throttled, type-safe output.
 
-```go
 	// Instantiate a limiter for the `string` type at 5 items per second.
 	limiter := chanlimiter.New[string](5)
 	defer limiter.Stop()
@@ -47,4 +42,5 @@ receives the throttled, type-safe output.
 	for msg := range limiter.Output() {
 		fmt.Printf("Received: %s\n", msg)
 	}
-```
+*/
+package chanlimiter
