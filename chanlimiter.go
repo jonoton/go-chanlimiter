@@ -7,7 +7,8 @@ import (
 )
 
 // Cleanable defines an interface for types that require explicit resource cleanup.
-// If a dropped item implements this interface, its Cleanup method will be called.
+// If a data item passed to the Limiter implements this interface, its Cleanup
+// method will be called automatically if the item is dropped.
 type Cleanable interface {
 	Cleanup()
 }
@@ -20,10 +21,9 @@ type config[T any] struct {
 // Option configures a Limiter using the functional options pattern.
 type Option[T any] func(*config[T])
 
-// WithBufferSize sets a custom buffer size for the input channel.
-// A larger buffer acts as a "shock absorber" for high-frequency bursts from
-// producers, preventing data from being dropped at the entrance while the
-// internal collector goroutine is momentarily busy.
+// WithBufferSize sets a custom buffer size for the input channel. A larger
+// buffer can absorb high-frequency bursts from producers without dropping data,
+// giving the internal collector goroutine time to process items.
 func WithBufferSize[T any](size int) Option[T] {
 	return func(c *config[T]) {
 		if size >= 1 {
@@ -33,9 +33,8 @@ func WithBufferSize[T any](size int) Option[T] {
 }
 
 // Limiter manages the regulated flow of data of any specific type T.
-// It ensures thread safety and drops the oldest data in favor of the most
-// recent item. If a dropped item implements the Cleanable interface, its
-// Cleanup() method is called.
+// It ensures thread-safe data transport from producers to a consumer at a
+// fixed rate, dropping the oldest unprocessed data in favor of the most recent.
 type Limiter[T any] struct {
 	input  chan T
 	output chan T
@@ -43,22 +42,23 @@ type Limiter[T any] struct {
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
 
-	// mu protects access to latestData and hasData, which are shared
-	// between the collector and ticker goroutines.
+	// mu protects access to latestData and hasData, which are shared between
+	// the collector and ticker goroutines.
 	mu         sync.Mutex
 	latestData T
 	hasData    bool
 }
 
-// New creates a new Limiter for any specific data type T with a given rate per second.
+// New creates a new Limiter for any specific data type T with a given rate
+// per second. The limiter can be customized with functional options.
 func New[T any](rate int, opts ...Option[T]) *Limiter[T] {
 	if rate <= 0 {
 		rate = 1
 	}
 
-	// 1. Setup default configuration. The default buffer size is based on the
-	// rate, which helps absorb at least one second of burst traffic. We apply
-	// reasonable bounds to prevent excessive memory usage.
+	// 1. Establish a smart default for the input buffer size.
+	// The default is based on the rate, which helps absorb at least one second
+	// of burst traffic. Reasonable bounds are applied to prevent excessive memory usage.
 	defaultBufferSize := rate
 	if defaultBufferSize < 16 {
 		defaultBufferSize = 16
@@ -75,7 +75,7 @@ func New[T any](rate int, opts ...Option[T]) *Limiter[T] {
 		opt(cfg)
 	}
 
-	// 3. Create the limiter with the final configuration.
+	// 3. Create and initialize the Limiter instance.
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Limiter[T]{
 		input:  make(chan T, cfg.bufferSize),
@@ -89,49 +89,41 @@ func New[T any](rate int, opts ...Option[T]) *Limiter[T] {
 	return l
 }
 
-// process is the heart of the limiter. It launches and manages two dedicated
-// goroutines to decouple data collection from rate-limited sending. This
-// two-goroutine pattern prevents "goroutine starvation," where a high-frequency
-// input could prevent a timer from ever being processed in a single select loop.
+// process is the heart of the limiter. It orchestrates the concurrent operations
+// by launching and managing two dedicated goroutines. This pattern decouples data
+// collection from rate-limited sending, preventing goroutine starvation where a
+// high-frequency producer could otherwise block a low-frequency timer.
 func (l *Limiter[T]) process(ctx context.Context) {
 	defer l.wg.Done()
 	var processWg sync.WaitGroup
 
-	// Goroutine 1: The Collector.
-	// Its only job is to receive from the input channel as fast as possible
-	// and store the most recent value. This ensures the "even dropping"
-	// logic is effective, as we're always working with the freshest data.
+	// --- Goroutine 1: The Collector ---
+	// Its sole responsibility is to receive data from the input channel as quickly
+	// as possible and update the single `latestData` slot. This ensures the
+	// limiter is always working with the most up-to-date information.
 	processWg.Add(1)
 	go func() {
 		defer processWg.Done()
-		for {
-			select {
-			case data, ok := <-l.input:
-				if !ok {
-					// Input channel was closed, time to exit.
-					return
+		// Using for...range is the idiomatic, race-free way to drain a
+		// channel until it is closed. This goroutine exits only when the
+		// input channel is closed and has been fully drained.
+		for data := range l.input {
+			l.mu.Lock()
+			if l.hasData {
+				if cleanable, ok := any(l.latestData).(Cleanable); ok {
+					cleanable.Cleanup()
 				}
-				l.mu.Lock()
-				// If we are about to overwrite an existing unsent item, check if it's
-				// Cleanable and call its Cleanup method.
-				if l.hasData {
-					if cleanable, ok := any(l.latestData).(Cleanable); ok {
-						cleanable.Cleanup()
-					}
-				}
-				l.latestData = data
-				l.hasData = true
-				l.mu.Unlock()
-			case <-ctx.Done():
-				return
 			}
+			l.latestData = data
+			l.hasData = true
+			l.mu.Unlock()
 		}
 	}()
 
-	// Goroutine 2: The Ticker/Sender.
-	// Its only job is to tick at a fixed rate. On each tick, it sends
-	// whatever data the Collector has stored. It does not listen on the
-	// input channel at all.
+	// --- Goroutine 2: The Ticker/Sender ---
+	// Its sole responsibility is to tick at the specified rate. On each tick,
+	// it sends the currently held `latestData` to the output channel. It does
+	// not interact with the input channel at all.
 	processWg.Add(1)
 	go func() {
 		defer processWg.Done()
@@ -143,36 +135,39 @@ func (l *Limiter[T]) process(ctx context.Context) {
 			case <-ticker.C:
 				l.mu.Lock()
 				if l.hasData {
-					// Use a non-blocking send to the output. If the consumer
-					// isn't ready, we don't want to block the ticker.
+					// Use a non-blocking send. If the consumer is not ready,
+					// we do not want to block the ticker.
 					select {
 					case l.output <- l.latestData:
-						// Sent successfully, so we can forget the data.
+						// Sent successfully, so we clear the slot.
 						l.hasData = false
 					default:
-						// Consumer was not ready. We DO NOTHING.
-						// The hasData flag remains true, so we will retry sending
-						// this item on the next tick, unless the collector
-						// overwrites it with newer data first.
+						// Consumer was not ready. We keep `hasData` as true,
+						// effectively retrying the send on the next tick
+						// unless the collector overwrites the data first.
 					}
 				}
 				l.mu.Unlock()
 			case <-ctx.Done():
+				// The context was canceled, time to exit.
 				return
 			}
 		}
 	}()
 
-	// Wait for the context to be canceled (via Stop()), then begin shutdown.
+	// --- Shutdown Sequence ---
+	// This block waits until Stop() is called, then orchestrates a graceful shutdown.
 	<-ctx.Done()
 
-	// 1. Close the input channel. This signals the collector goroutine to stop.
+	// 1. Close the input channel. This is the signal for the Collector's
+	//    for...range loop to drain any remaining buffered items and then terminate.
 	close(l.input)
 
-	// 2. Wait for both the collector and ticker goroutines to finish.
+	// 2. Wait for both the Collector and Ticker goroutines to finish their work.
 	processWg.Wait()
 
-	// 3. Final cleanup for any data that was held when the limiter was stopped.
+	// 3. Perform a final cleanup for the very last item that may have been
+	//    held by the collector when the system shut down.
 	l.mu.Lock()
 	if l.hasData {
 		if cleanable, ok := any(l.latestData).(Cleanable); ok {
@@ -181,26 +176,26 @@ func (l *Limiter[T]) process(ctx context.Context) {
 	}
 	l.mu.Unlock()
 
-	// 4. Finally, close the output channel to signal to consumers that no
-	// more data will be sent.
+	// 4. Finally, close the output channel to signal to any consumers that no
+	//    more data will be sent.
 	close(l.output)
 }
 
-// Send sends data to the limiter. This is a non-blocking call.
+// Send submits data to the limiter. This is a non-blocking call.
 func (l *Limiter[T]) Send(data T) {
 	// A panic can occur if Send is called on a stopped limiter after the
 	// input channel has been closed. This recover prevents the application
-	// from crashing in that edge case.
+	// from crashing in this specific race condition.
 	defer func() {
 		recover()
 	}()
 
 	select {
 	case l.input <- data:
-		// Data successfully sent to the input buffer.
+		// Data was successfully placed in the input buffer.
 	default:
-		// The input buffer is full. The data is dropped.
-		// Check if the dropped data is Cleanable and call its Cleanup method.
+		// The input buffer is full, so the data is dropped.
+		// If the data is Cleanable, its Cleanup method is called.
 		if cleanable, ok := any(data).(Cleanable); ok {
 			cleanable.Cleanup()
 		}
@@ -212,10 +207,9 @@ func (l *Limiter[T]) Output() <-chan T {
 	return l.output
 }
 
-// Stop gracefully shuts down the limiter and all its internal goroutines.
+// Stop gracefully shuts down the limiter. This call will block until all
+// internal goroutines have finished and all necessary cleanup has been performed.
 func (l *Limiter[T]) Stop() {
-	// Signal the context to be canceled.
 	l.cancel()
-	// Wait for the main process goroutine to complete its shutdown sequence.
 	l.wg.Wait()
 }

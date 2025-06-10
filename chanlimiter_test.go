@@ -57,7 +57,7 @@ func TestCleanupOnSendDrop(t *testing.T) {
 	item2 := &cleanableItem{id: 2, cleanupChan: cleanupChan}
 
 	// Use a small buffer to force a drop.
-	limiter := New[*cleanableItem](1, WithBufferSize[*cleanableItem](1))
+	limiter := New(1, WithBufferSize[*cleanableItem](1))
 	defer limiter.Stop()
 
 	limiter.Send(item1) // This fills the buffer.
@@ -75,7 +75,7 @@ func TestCleanupOnSendDrop(t *testing.T) {
 	}
 }
 
-// TestCleanupOnStop verifies that Cleanup is called for a held item on shutdown.
+// TestCleanupOnStop verifies that Cleanup is called for a single held item on shutdown.
 func TestCleanupOnStop(t *testing.T) {
 	cleanupChan := make(chan int, 1)
 	item1 := &cleanableItem{id: 1, cleanupChan: cleanupChan}
@@ -97,17 +97,54 @@ func TestCleanupOnStop(t *testing.T) {
 	}
 }
 
+// TestCleanupAllBufferedItemsOnStop verifies all items in the buffer are cleaned on Stop.
+func TestCleanupAllBufferedItemsOnStop(t *testing.T) {
+	cleanupChan := make(chan int, 5)
+	items := []*cleanableItem{
+		{id: 1, cleanupChan: cleanupChan},
+		{id: 2, cleanupChan: cleanupChan},
+		{id: 3, cleanupChan: cleanupChan},
+	}
+
+	// Use a large buffer and slow rate.
+	limiter := New(1, WithBufferSize[*cleanableItem](10))
+
+	// Send all items into the buffer without giving the limiter time to process.
+	for _, item := range items {
+		limiter.Send(item)
+	}
+
+	// Stop is a blocking call that waits for all goroutines to finish.
+	// By the time it returns, all cleanup should have been performed.
+	limiter.Stop()
+
+	// Close the channel to signal that we are done sending cleanup signals.
+	close(cleanupChan)
+
+	// Collect all cleanup signals from the channel.
+	cleanedIDs := make(map[int]bool)
+	for id := range cleanupChan {
+		cleanedIDs[id] = true
+	}
+
+	if len(cleanedIDs) != len(items) {
+		t.Errorf("expected %d items to be cleaned up, but only %d were", len(items), len(cleanedIDs))
+	}
+
+	// Verify that each specific item was indeed cleaned up.
+	for _, item := range items {
+		if !cleanedIDs[item.id] {
+			t.Errorf("item with ID %d was not cleaned up", item.id)
+		}
+	}
+}
+
 // TestNoCleanupForNonCleanable ensures the limiter works with non-cleanable types.
 func TestNoCleanupForNonCleanable(t *testing.T) {
-	// This test simply verifies that the limiter can be instantiated and used
-	// with a type like `int` that does not implement Cleanable, without panicking.
 	limiter := New[int](10)
 	defer limiter.Stop()
-
 	limiter.Send(1)
-	limiter.Send(2) // Overwrite
-
-	// The test passes if it completes without a panic.
+	limiter.Send(2)
 }
 
 // TestNewLimiter verifies the correct initialization of a new Limiter.
@@ -116,7 +153,6 @@ func TestNewLimiter(t *testing.T) {
 		rate := 10
 		limiter := New[int](rate)
 		defer limiter.Stop()
-
 		if limiter == nil {
 			t.Fatal("New() returned nil")
 		}
@@ -130,9 +166,8 @@ func TestNewLimiter(t *testing.T) {
 // TestWithBufferSizeOption verifies that a custom buffer size is applied correctly.
 func TestWithBufferSizeOption(t *testing.T) {
 	customSize := 5
-	limiter := New[int](10, WithBufferSize[int](customSize))
+	limiter := New(10, WithBufferSize[int](customSize))
 	defer limiter.Stop()
-
 	if cap(limiter.input) != customSize {
 		t.Errorf("expected buffer size of %d, but got %d", customSize, cap(limiter.input))
 	}
@@ -142,7 +177,7 @@ func TestWithBufferSizeOption(t *testing.T) {
 func TestDefaultBufferSize(t *testing.T) {
 	t.Run("RateWithinBounds", func(t *testing.T) {
 		rate := 50
-		limiter := New[int](rate) // No option provided
+		limiter := New[int](rate)
 		defer limiter.Stop()
 		if cap(limiter.input) != rate {
 			t.Errorf("expected default buffer size of %d, but got %d", rate, cap(limiter.input))
@@ -152,12 +187,10 @@ func TestDefaultBufferSize(t *testing.T) {
 
 // TestBufferSizeFunctionality proves the buffer works by allowing non-blocking sends.
 func TestBufferSizeFunctionality(t *testing.T) {
-	limiter := New[int](1, WithBufferSize[int](2))
+	limiter := New(1, WithBufferSize[int](2))
 	defer limiter.Stop()
-
 	limiter.Send(1)
-	limiter.Send(2) // This will overwrite item 1.
-
+	limiter.Send(2)
 	select {
 	case item := <-limiter.Output():
 		if item != 2 {
@@ -166,7 +199,6 @@ func TestBufferSizeFunctionality(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for item from limiter output")
 	}
-
 	select {
 	case item := <-limiter.Output():
 		t.Errorf("expected no more items, but received %d", item)
@@ -180,19 +212,15 @@ func TestRateLimiting(t *testing.T) {
 	duration := 2 * time.Second
 	limiter := New[int](rate)
 	defer limiter.Stop()
-
 	go func() {
 		for i := 0; ; i++ {
 			limiter.Send(i)
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
-
 	time.Sleep(200 * time.Millisecond)
-
 	receivedCount := 0
 	timeout := time.After(duration)
-
 ConsumerLoop:
 	for {
 		select {
@@ -202,7 +230,6 @@ ConsumerLoop:
 			break ConsumerLoop
 		}
 	}
-
 	expectedCount := rate * int(duration.Seconds())
 	margin := 2
 	if receivedCount < expectedCount-margin || receivedCount > expectedCount+margin {
@@ -216,27 +243,22 @@ func TestRateIsCorrect(t *testing.T) {
 	itemsToReceive := 20
 	limiter := New[int](rate)
 	defer limiter.Stop()
-
 	go func() {
 		for i := 0; ; i++ {
 			limiter.Send(i)
 			time.Sleep(1 * time.Millisecond)
 		}
 	}()
-
 	time.Sleep(50 * time.Millisecond)
 	startTime := time.Now()
-
 	for i := 0; i < itemsToReceive; i++ {
 		<-limiter.Output()
 	}
-
 	elapsedTime := time.Since(startTime)
 	expectedDuration := time.Duration(itemsToReceive) * (time.Second / time.Duration(rate))
 	margin := expectedDuration / 4
 	minDuration := expectedDuration - margin
 	maxDuration := expectedDuration + margin
-
 	if elapsedTime < minDuration || elapsedTime > maxDuration {
 		t.Errorf("expected to receive %d items in ~%v, but it took %v", itemsToReceive, expectedDuration, elapsedTime)
 	}
@@ -246,21 +268,17 @@ func TestRateIsCorrect(t *testing.T) {
 func TestEvenDropping(t *testing.T) {
 	limiter := New[int](1)
 	defer limiter.Stop()
-
 	for i := 0; i < 100; i++ {
 		limiter.Send(i)
 		time.Sleep(10 * time.Millisecond)
 	}
-
 	time.Sleep(1100 * time.Millisecond)
-
 	var receivedData int
 	select {
 	case receivedData = <-limiter.Output():
 	default:
 		t.Fatal("did not receive any data after waiting")
 	}
-
 	if receivedData < 80 {
 		t.Errorf("expected a high-numbered item (the most recent), but got %d", receivedData)
 	}
@@ -271,16 +289,16 @@ func TestStop(t *testing.T) {
 	limiter := New[string](10)
 	time.Sleep(50 * time.Millisecond)
 	limiter.Stop()
-
 	select {
 	case _, ok := <-limiter.Output():
-		if ok {
+		if !ok {
+			// Expected outcome
+		} else {
 			t.Error("output channel should be closed after Stop(), but it's not")
 		}
 	case <-time.After(1 * time.Second):
 		t.Error("limiter did not close the output channel within 1 second")
 	}
-
 	limiter.Send("test")
 }
 
@@ -289,7 +307,6 @@ func TestConcurrentProducers(t *testing.T) {
 	rate := 20
 	limiter := New[string](rate)
 	defer limiter.Stop()
-
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
